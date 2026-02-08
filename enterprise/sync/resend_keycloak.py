@@ -26,12 +26,14 @@ Optional environment variables:
 """
 
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
 import resend
 from keycloak.exceptions import KeycloakError
+from resend.exceptions import ResendError
 from server.auth.token_manager import get_keycloak_admin
 from tenacity import (
     retry,
@@ -89,6 +91,31 @@ class ResendAPIError(ResendSyncError):
     pass
 
 
+# Email validation regex pattern - matches standard email format
+# This pattern is intentionally strict to avoid Resend API validation errors
+# It rejects special characters like ! that some email providers technically allow
+# but Resend's API does not accept
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+
+def is_valid_email(email: str) -> bool:
+    """Validate an email address format.
+
+    This uses a regex pattern that matches most valid email addresses
+    while rejecting addresses with special characters that Resend's API
+    does not accept (e.g., exclamation marks).
+
+    Args:
+        email: The email address to validate.
+
+    Returns:
+        True if the email is valid, False otherwise.
+    """
+    if not email:
+        return False
+    return bool(EMAIL_REGEX.match(email))
+
+
 def is_rate_limit_error(exception: BaseException) -> bool:
     """Check if an exception is a rate limit error.
 
@@ -103,6 +130,13 @@ def is_rate_limit_error(exception: BaseException) -> bool:
         indicator in error_str
         for indicator in ['rate limit', 'too many requests', '429']
     )
+
+
+def _is_retryable_resend_error(exception: BaseException) -> bool:
+    """Check if an exception is retryable (rate limit or connection error)."""
+    if isinstance(exception, (ConnectionError, TimeoutError)):
+        return True
+    return is_rate_limit_error(exception)
 
 
 def get_keycloak_users(offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
@@ -209,13 +243,6 @@ def get_resend_contacts(audience_id: str) -> Dict[str, Dict[str, Any]]:
         raise
 
 
-def _is_retryable_resend_error(exception: BaseException) -> bool:
-    """Check if an exception is retryable (rate limit or connection error)."""
-    if isinstance(exception, (ConnectionError, TimeoutError)):
-        return True
-    return is_rate_limit_error(exception)
-
-
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
     wait=wait_exponential(
@@ -288,7 +315,7 @@ def send_welcome_email(
         The API response.
 
     Raises:
-        resend.exceptions.ResendError: If the API call fails.
+        ResendError: If the API call fails.
     """
     # Add a small delay to proactively avoid rate limits (2 req/sec = 0.5s between requests)
     time.sleep(1 / RATE_LIMIT)
@@ -382,6 +409,7 @@ def sync_users_to_resend():
             'total_users': total_users,
             'existing_contacts': len(resend_contacts),
             'added_contacts': 0,
+            'skipped_invalid_emails': 0,
             'errors': 0,
         }
 
@@ -399,6 +427,12 @@ def sync_users_to_resend():
                 email = email.lower()
                 if email in resend_contacts:
                     logger.debug(f'User {email} already exists in Resend, skipping')
+                    continue
+
+                # Validate email format before attempting to add to Resend
+                if not is_valid_email(email):
+                    logger.warning(f'Skipping user with invalid email format: {email}')
+                    stats['skipped_invalid_emails'] += 1
                     continue
 
                 try:
